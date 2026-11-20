@@ -49,13 +49,20 @@ class Store:
         return json.loads(row[0]) if row else None
 
     def watermark(self):
-        row = self.con.execute("SELECT v FROM meta WHERE k='watermark'").fetchone()
-        return row[0] if row else None
+        return self.get_meta("watermark")
 
     def set_watermark(self, value):
+        self.set_meta("watermark", value)
+
+    def get_meta(self, key):
+        row = self.con.execute(
+            "SELECT v FROM meta WHERE k=?", (str(key),)).fetchone()
+        return row[0] if row else None
+
+    def set_meta(self, key, value):
         self.con.execute(
-            "INSERT INTO meta(k,v) VALUES('watermark',?) "
-            "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (str(value),))
+            "INSERT INTO meta(k,v) VALUES(?,?) "
+            "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (str(key), str(value)))
         self.con.commit()
 
     def reset(self):

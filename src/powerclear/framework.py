@@ -81,6 +81,11 @@ class Http:
 # --------------------------------------------------------------------------- #
 def _coerce(name, val):
     if name in SPEC.int_fields:
+        # Booleans are not prices, and floats must not be truncated to
+        # int (that would silently destroy precision).  Leave both for
+        # the kernel to classify.
+        if isinstance(val, (bool, int, float)):
+            return val
         try:
             return int(val)
         except (TypeError, ValueError):
@@ -163,30 +168,85 @@ def normalize(r):
     return d
 
 
+def _kernel_error_fields(exc):
+    """Fallback judgement when the kernel itself fails on one record.
+
+    A single bad record must never sink the run or corrupt the normal
+    clearing records around it.
+    """
+    try:
+        k = importlib.import_module(".kernel", __package__)
+        version = getattr(k, "RULE_VERSION", "unknown")
+    except Exception:
+        version = "unknown"
+    return {"value_raw": None, "value_norm": None, "value_status": "invalid",
+            "value_precision": None, "scale_factor": 1, "was_large": 0,
+            "flags": ["kernel_error"],
+            "reasons": ["kernel_error:%s" % type(exc).__name__],
+            "rule_version": version}
+
+
 def _apply_kernel(records):
     k = importlib.import_module(".kernel", __package__)
+    out = []
     for r in records:
         if hasattr(k, "process"):
-            r.update(k.process(r))
+            try:
+                r.update(k.process(r) or {})
+            except Exception as exc:
+                fallback = _kernel_error_fields(exc)
+                fallback["value_raw"] = r.get("value")
+                r.update(fallback)
+        out.append(r)
     if hasattr(k, "reduce"):
-        records = k.reduce(records)
-    return records
+        out = k.reduce(out)
+    return out
+
+
+def _kernel_rule_version():
+    try:
+        k = importlib.import_module(".kernel", __package__)
+        return getattr(k, "RULE_VERSION", None)
+    except Exception:
+        return None
+
+
+def _note_rule_version(store, rule_version):
+    """Record the rule version used by this run in the store metadata.
+
+    The ordered list of versions ever applied keeps historical
+    judgements explainable after the rules change; stored records are
+    never rewritten, so their stamped ``rule_version`` stays accurate.
+    """
+    if not rule_version:
+        return
+    try:
+        seen = json.loads(store.get_meta("rule_versions") or "[]")
+    except ValueError:
+        seen = []
+    if not isinstance(seen, list):
+        seen = []
+    if rule_version not in seen:
+        seen.append(rule_version)
+        store.set_meta("rule_versions", json.dumps(seen, ensure_ascii=False))
 
 
 # --------------------------------------------------------------------------- #
 # Collection pipeline.
 # --------------------------------------------------------------------------- #
-def run(mode="full", con=None):
+def run(mode="full", con=None, http=None):
     own = con is None
     con = con or Store().connect()
     store = Store(con)
-    sleeper = Sleeper()
-    http = Http(Transport(), sleeper)
+    if http is None:
+        http = Http(Transport(), Sleeper())
+    sleeper = getattr(http, "sleeper", None)
     try:
         records, attempts = fetch_all(http)
         norm = [normalize(dict(r)) for r in records]
         norm, dup_in_batch = dedup(norm)
         norm = _apply_kernel(norm)
+        rule_version = _kernel_rule_version()
 
         wm = store.watermark()
         if mode == "incremental" and wm:
@@ -197,10 +257,13 @@ def run(mode="full", con=None):
         new_wm = max([str(r.get("ts", "")) for r in norm] + [wm or ""])
         if new_wm:
             store.set_watermark(new_wm)
+        _note_rule_version(store, rule_version)
         return {"engine": "crawl", "mode": mode, "fetched": len(records),
                 "duplicates": dup_in_batch, "ingested": ingested, "count": total,
-                "http_attempts": attempts, "slept": round(sleeper.slept, 4),
-                "watermark": store.watermark()}
+                "http_attempts": attempts,
+                "slept": round(sleeper.slept, 4) if sleeper else 0.0,
+                "watermark": store.watermark(),
+                "rule_version": rule_version}
     finally:
         if own:
             con.close()
@@ -298,10 +361,13 @@ def run_rpa(con=None):
         wm = max([str(x.get("ts", "")) for x in norm] + [""])
         if wm:
             store.set_watermark(wm)
+        rule_version = _kernel_rule_version()
+        _note_rule_version(store, rule_version)
         return {"engine": "rpa", "logged_in": logged, "captcha_solved": r.captcha_solved,
                 "collected": len(items), "fetched": len(items), "duplicates": dup,
                 "ingested": ingested, "count": total,
-                "submit_created": created, "submit_dedup": dedup_submit, "log": r.log}
+                "submit_created": created, "submit_dedup": dedup_submit,
+                "rule_version": rule_version, "log": r.log}
     finally:
         if own:
             con.close()
